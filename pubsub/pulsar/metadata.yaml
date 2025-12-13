@@ -222,3 +222,9 @@ metadata:
     url: 
       title: "Pulsar SubscriptionMode"
       url: "https://pkg.go.dev/github.com/apache/pulsar-client-go/pulsar#SubscriptionMode"
+  - name: clientSecretPath
+    type: string
+    description: |
+      The path to the OAuth Client Secret.
+    example: |
+      "/path/to/oauth2/client_secret.json"
