@@ -13,4 +13,4 @@ spec:
   - name: redeliveryDelay
     value: 200ms
   - name: certification-pubsub-topic-active.avroschema
-    value: "{\"type\":\"record\",\"name\":\"Example\",\"namespace\":\"test\",\"fields\":[{\"name\":\"id\",\"type\":\"int\"},{\"name\":\"name\",\"type\":\"string\"}]}"
+    value: "{\"type\":\"record\",\"name\":\"Example\",\"namespace\":\"test\",\"fields\":[{\"name\":\"testId\",\"type\":\"int\"},{\"name\":\"testName\",\"type\":\"string\"}]}"
