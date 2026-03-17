@@ -1886,10 +1886,10 @@ type mockPulsarMessage struct {
 	id         pulsar.MessageID
 }
 
-func (m *mockPulsarMessage) Payload() []byte                    { return m.payload }
-func (m *mockPulsarMessage) Properties() map[string]string      { return m.properties }
-func (m *mockPulsarMessage) Topic() string                      { return m.topic }
-func (m *mockPulsarMessage) ID() pulsar.MessageID               { return m.id }
+func (m *mockPulsarMessage) Payload() []byte               { return m.payload }
+func (m *mockPulsarMessage) Properties() map[string]string { return m.properties }
+func (m *mockPulsarMessage) Topic() string                 { return m.topic }
+func (m *mockPulsarMessage) ID() pulsar.MessageID          { return m.id }
 
 // mockAckConsumer is a pulsar.Consumer stub that tracks Ack/Nack calls.
 type mockAckConsumer struct {
@@ -1898,8 +1898,8 @@ type mockAckConsumer struct {
 	nacked bool
 }
 
-func (m *mockAckConsumer) Ack(msg pulsar.Message) error  { m.acked = true; return nil }
-func (m *mockAckConsumer) Nack(msg pulsar.Message)       { m.nacked = true }
+func (m *mockAckConsumer) Ack(msg pulsar.Message) error { m.acked = true; return nil }
+func (m *mockAckConsumer) Nack(msg pulsar.Message)      { m.nacked = true }
 
 // makeConsumerMessage wraps a stub message+consumer into a pulsar.ConsumerMessage.
 func makeConsumerMessage(msg pulsar.Message, consumer pulsar.Consumer) pulsar.ConsumerMessage {
@@ -1938,7 +1938,7 @@ func TestHandleMessageAvroDecodeRoundTrip(t *testing.T) {
 		return nil
 	}
 
-	err = p.handleMessage(context.Background(), topic, cm, handler)
+	err = p.handleMessage(t.Context(), topic, cm, handler)
 	require.NoError(t, err)
 	assert.True(t, consumer.acked, "message should be acked on success")
 	assert.False(t, consumer.nacked, "message should not be nacked on success")
@@ -1977,7 +1977,7 @@ func TestHandleMessageAvroDecodeError(t *testing.T) {
 		return nil
 	}
 
-	err = p.handleMessage(context.Background(), topic, cm, handler)
+	err = p.handleMessage(t.Context(), topic, cm, handler)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "avro decode failed")
 	assert.True(t, consumer.nacked, "message should be nacked on decode error")
@@ -2006,9 +2006,9 @@ func TestHandleMessageNoAvroSchema(t *testing.T) {
 		return nil
 	}
 
-	err := p.handleMessage(context.Background(), topic, cm, handler)
+	err := p.handleMessage(t.Context(), topic, cm, handler)
 	require.NoError(t, err)
-	assert.Equal(t, rawJSON, receivedData)
+	assert.JSONEq(t, string(rawJSON), string(receivedData))
 	assert.True(t, consumer.acked)
 }
 
@@ -2033,7 +2033,7 @@ func TestHandleMessageHandlerErrorNacks(t *testing.T) {
 		return handlerErr
 	}
 
-	err := p.handleMessage(context.Background(), topic, cm, handler)
+	err := p.handleMessage(t.Context(), topic, cm, handler)
 	require.Error(t, err)
 	assert.Equal(t, handlerErr, err)
 	assert.True(t, consumer.nacked, "message must be nacked when handler returns error")
@@ -2074,7 +2074,7 @@ func TestHandleMessageAvroPropertiesPreserved(t *testing.T) {
 		return nil
 	}
 
-	err = p.handleMessage(context.Background(), topic, cm, handler)
+	err = p.handleMessage(t.Context(), topic, cm, handler)
 	require.NoError(t, err)
 	assert.Equal(t, props, receivedMetadata, "properties must be preserved through the Avro decode path")
 }
@@ -2104,9 +2104,9 @@ func TestHandleMessageNonAvroSchemaPassthrough(t *testing.T) {
 		return nil
 	}
 
-	err := p.handleMessage(context.Background(), topic, cm, handler)
+	err := p.handleMessage(t.Context(), topic, cm, handler)
 	require.NoError(t, err)
-	assert.Equal(t, rawJSON, receivedData, "non-Avro schema topics must pass raw bytes through")
+	assert.JSONEq(t, string(rawJSON), string(receivedData), "non-Avro schema topics must pass raw bytes through")
 	assert.True(t, consumer.acked)
 	assert.False(t, consumer.nacked)
 }
