@@ -882,43 +882,43 @@ type schemaTest struct {
 	Name string `json:"name"`
 }
 
+func publishSchemaMessages(sidecarName string, topicName string, messageWatchers ...*watcher.Watcher) flow.Runnable {
+	return func(ctx flow.Context) error {
+		// prepare the messages
+		messages := make([]string, numMessages)
+		for i := range messages {
+			test := &schemaTest{
+				ID:   i,
+				Name: uuid.New().String(),
+			}
+
+			b, _ := json.Marshal(test)
+			messages[i] = string(b)
+		}
+
+		for _, messageWatcher := range messageWatchers {
+			messageWatcher.ExpectStrings(messages...)
+		}
+
+		// get the sidecar (dapr) client
+		client := sidecar.GetClient(ctx, sidecarName)
+
+		// publish messages
+		ctx.Logf("Publishing messages. sidecarName: %s, topicName: %s", sidecarName, topicName)
+
+		for _, message := range messages {
+			ctx.Logf("Publishing: %q", message)
+
+			err := client.PublishEvent(ctx, pubsubName, topicName, message)
+			require.NoError(ctx, err, "error publishing message")
+		}
+		return nil
+	}
+}
+
 func (p *pulsarSuite) TestPulsarSchema() {
 	t := p.T()
 	consumerGroup1 := watcher.NewUnordered()
-
-	publishMessages := func(sidecarName string, topicName string, messageWatchers ...*watcher.Watcher) flow.Runnable {
-		return func(ctx flow.Context) error {
-			// prepare the messages
-			messages := make([]string, numMessages)
-			for i := range messages {
-				test := &schemaTest{
-					ID:   i,
-					Name: uuid.New().String(),
-				}
-
-				b, _ := json.Marshal(test)
-				messages[i] = string(b)
-			}
-
-			for _, messageWatcher := range messageWatchers {
-				messageWatcher.ExpectStrings(messages...)
-			}
-
-			// get the sidecar (dapr) client
-			client := sidecar.GetClient(ctx, sidecarName)
-
-			// publish messages
-			ctx.Logf("Publishing messages. sidecarName: %s, topicName: %s", sidecarName, topicName)
-
-			for _, message := range messages {
-				ctx.Logf("Publishing: %q", message)
-
-				err := client.PublishEvent(ctx, pubsubName, topicName, message)
-				require.NoError(ctx, err, "error publishing message")
-			}
-			return nil
-		}
-	}
 
 	flow.New(t, "pulsar certification schema test").
 
@@ -955,7 +955,51 @@ func (p *pulsarSuite) TestPulsarSchema() {
 				embedded.WithDaprHTTPPort(strconv.Itoa(runtime.DefaultDaprHTTPPort)),
 			)...,
 		)).
-		Step("publish messages to topic1", publishMessages(sidecarName1, topicActiveName, consumerGroup1)).
+		Step("publish messages to topic1", publishSchemaMessages(sidecarName1, topicActiveName, consumerGroup1)).
+		Step("verify if app1 has received messages published to topic", assertMessages(10*time.Second, consumerGroup1)).
+		Run()
+}
+
+func (p *pulsarSuite) TestPulsarAvroSchema() {
+	t := p.T()
+	consumerGroup1 := watcher.NewUnordered()
+
+	flow.New(t, "pulsar certification avro schema test").
+
+		// Run subscriberApplication app1
+		Step(app.Run(appID1, fmt.Sprintf(":%d", appPort),
+			subscriberSchemaApplication(appID1, topicActiveName, consumerGroup1))).
+		Step(dockercompose.Run(clusterName, p.dockerComposeYAML)).
+		Step("wait", flow.Sleep(10*time.Second)).
+		Step("wait for pulsar readiness", retry.Do(10*time.Second, 30, func(ctx flow.Context) error {
+			client, err := p.client(t)
+			if err != nil {
+				return fmt.Errorf("could not create pulsar client: %v", err)
+			}
+
+			defer client.Close()
+
+			consumer, err := client.Subscribe(pulsar.ConsumerOptions{
+				Topic:            "topic-1",
+				SubscriptionName: "my-sub",
+				Type:             pulsar.Shared,
+			})
+			if err != nil {
+				return fmt.Errorf("could not create pulsar Topic: %v", err)
+			}
+			defer consumer.Close()
+
+			return err
+		})).
+		Step(sidecar.Run(sidecarName1,
+			append(componentRuntimeOptions(),
+				embedded.WithComponentsPath(filepath.Join(p.componentsPath, "consumer_nine")),
+				embedded.WithAppProtocol(protocol.HTTPProtocol, strconv.Itoa(appPort)),
+				embedded.WithDaprGRPCPort(strconv.Itoa(runtime.DefaultDaprAPIGRPCPort)),
+				embedded.WithDaprHTTPPort(strconv.Itoa(runtime.DefaultDaprHTTPPort)),
+			)...,
+		)).
+		Step("publish messages to topic1", publishSchemaMessages(sidecarName1, topicActiveName, consumerGroup1)).
 		Step("verify if app1 has received messages published to topic", assertMessages(10*time.Second, consumerGroup1)).
 		Run()
 }
