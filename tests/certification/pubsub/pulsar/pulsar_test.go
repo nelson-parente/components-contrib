@@ -901,8 +901,17 @@ func subscriberAvroSchemaApplication(appID string, topicName string, messagesWat
 				// so that it matches the published strings.
 				dataStr := fmt.Sprintf("%s", e.Data)
 				var obj avroSchemaTest
-				json.Unmarshal([]byte(dataStr), &obj)
-				normalized, _ := json.Marshal(obj)
+				if err := json.Unmarshal([]byte(dataStr), &obj); err != nil {
+					ctx.Logf("failed to unmarshal Avro schema payload in subscriber (appID=%s, topic=%s, id=%s): %v", appID, e.Topic, e.ID, err)
+					// Non-retryable error so the test fails clearly on bad payloads.
+					return false, fmt.Errorf("subscriberAvroSchemaApplication: unmarshal payload: %w", err)
+				}
+				normalized, err := json.Marshal(obj)
+				if err != nil {
+					ctx.Logf("failed to marshal normalized Avro schema payload in subscriber (appID=%s, topic=%s, id=%s): %v", appID, e.Topic, e.ID, err)
+					// Non-retryable error so the test fails clearly on bad normalization.
+					return false, fmt.Errorf("subscriberAvroSchemaApplication: marshal normalized payload: %w", err)
+				}
 				messagesWatcher.Observe(string(normalized))
 				ctx.Logf("Message Received appID: %s,pubsub: %s, topic: %s, id: %s, data: %s", appID, e.PubsubName, e.Topic, e.ID, e.Data)
 				return false, nil
@@ -921,7 +930,8 @@ func publishSchemaMessages(sidecarName string, topicName string, messageWatchers
 				Name: uuid.New().String(),
 			}
 
-			b, _ := json.Marshal(test)
+			b, err := json.Marshal(test)
+			require.NoError(ctx, err, "error marshaling schemaTest")
 			messages[i] = string(b)
 		}
 
