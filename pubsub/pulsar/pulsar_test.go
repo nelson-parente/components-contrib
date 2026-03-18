@@ -1898,8 +1898,14 @@ type mockAckConsumer struct {
 	nacked bool
 }
 
-func (m *mockAckConsumer) Ack(msg pulsar.Message) error { m.acked = true; return nil }
-func (m *mockAckConsumer) Nack(msg pulsar.Message)      { m.nacked = true }
+func (m *mockAckConsumer) Ack(msg pulsar.Message) error {
+	m.acked = true
+	return nil
+}
+
+func (m *mockAckConsumer) Nack(msg pulsar.Message) {
+	m.nacked = true
+}
 
 // makeConsumerMessage wraps a stub message+consumer into a pulsar.ConsumerMessage.
 func makeConsumerMessage(msg pulsar.Message, consumer pulsar.Consumer) pulsar.ConsumerMessage {
