@@ -964,7 +964,8 @@ func publishAvroSchemaMessages(sidecarName string, topicName string, messageWatc
 				TestName: uuid.New().String(),
 			}
 
-			b, _ := json.Marshal(test)
+			b, err := json.Marshal(test)
+			require.NoError(ctx, err, "error marshaling avroSchemaTest")
 			messages[i] = string(b)
 		}
 
