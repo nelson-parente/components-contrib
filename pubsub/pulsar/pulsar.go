@@ -192,6 +192,20 @@ func parsePulsarMetadata(meta pubsub.Metadata) (*pulsarMetadata, error) {
 		return nil, errors.New("invalid compression level. Accepted values are `default`, `faster` and `better`")
 	}
 
+	// Normalize and validate processMode.
+	m.ProcessMode = strings.ToLower(m.ProcessMode)
+	switch m.ProcessMode {
+	case processModeSync, processModeAsync, "":
+		// valid
+	default:
+		return nil, fmt.Errorf("invalid processMode %q: accepted values are %q and %q", m.ProcessMode, processModeAsync, processModeSync)
+	}
+
+	// Guard against zero MaxConcurrentHandlers which would deadlock the semaphore.
+	if m.MaxConcurrentHandlers == 0 {
+		m.MaxConcurrentHandlers = defaultConcurrency
+	}
+
 	// First pass: collect per-topic rawSchema flags.
 	rawSchemaTopics := make(map[string]bool)
 	for k, v := range meta.Properties {
@@ -703,30 +717,47 @@ func (p *Pulsar) Subscribe(ctx context.Context, req pubsub.SubscribeRequest, han
 func (p *Pulsar) listenMessage(ctx context.Context, req pubsub.SubscribeRequest, consumer pulsar.Consumer, handler pubsub.Handler) {
 	defer consumer.Close()
 
+	// Resolve effective process mode: component metadata is already normalized
+	// to lowercase in parsePulsarMetadata; subscription metadata may override.
+	mode := p.metadata.ProcessMode
+	if v, ok := req.Metadata[processModeKey]; ok {
+		mode = strings.ToLower(v)
+	}
+
+	// Semaphore to bound the number of concurrent async handler goroutines.
+	// The semaphore slot is acquired before spawning a goroutine (outside the
+	// goroutine) so that the read loop blocks — providing backpressure —
+	// when MaxConcurrentHandlers goroutines are already active.
+	sem := make(chan struct{}, p.metadata.MaxConcurrentHandlers)
+
 	originTopic := req.Topic
-	var err error
 	for {
 		select {
 		case msg := <-consumer.Chan():
-			if strings.ToLower(req.Metadata[processModeKey]) == processModeSync { //nolint:gocritic
-				err = p.handleMessage(ctx, originTopic, msg, handler)
-				if err != nil && !errors.Is(err, context.Canceled) {
+			if mode == processModeSync { //nolint:gocritic
+				if err := p.handleMessage(ctx, originTopic, msg, handler); err != nil && !errors.Is(err, context.Canceled) {
 					p.logger.Errorf("Error sync processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
 				}
 			} else { // async process mode by default
-				// Go routine to handle multiple messages at once.
+				// Acquire a semaphore slot before spawning the goroutine.
+				// Use a select so that context cancellation unblocks a waiting acquire.
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
 				p.wg.Add(1)
 				go func(msg pulsar.ConsumerMessage) {
 					defer p.wg.Done()
-					err = p.handleMessage(ctx, originTopic, msg, handler)
-					if err != nil && !errors.Is(err, context.Canceled) {
+					defer func() { <-sem }()
+					if err := p.handleMessage(ctx, originTopic, msg, handler); err != nil && !errors.Is(err, context.Canceled) {
 						p.logger.Errorf("Error async processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
 					}
 				}(msg)
 			}
 
 		case <-ctx.Done():
-			p.logger.Errorf("Subscription context done. Closing consumer. Err: %s", ctx.Err())
+			p.logger.Debugf("Subscription context done. Closing consumer. Err: %s", ctx.Err())
 			return
 		}
 	}
