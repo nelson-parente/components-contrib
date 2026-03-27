@@ -22,6 +22,7 @@ package pulsar
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,7 +40,7 @@ import (
 
 // ---------------------------------------------------------------------------
 // Mock types for testing listenMessage without a real Pulsar broker.
-// These are shared across process_mode_test.go and pulsar_semaphore_test.go.
+// These are shared across process_mode_test.go and pulsar_backpressure_test.go.
 // ---------------------------------------------------------------------------
 
 // mockMessage provides the minimum pulsarclient.Message implementation needed
@@ -63,7 +64,7 @@ func (m *mockMessage) GetSchemaValue(_ interface{}) error                    { r
 func (m *mockMessage) RedeliveryCount() uint32                               { return 0 }
 func (m *mockMessage) IsReplicated() bool                                    { return false }
 func (m *mockMessage) GetReplicatedFrom() string                             { return "" }
-func (m *mockMessage) GetEncryptionContext() *pulsarclient.EncryptionContext  { return nil }
+func (m *mockMessage) GetEncryptionContext() *pulsarclient.EncryptionContext { return nil }
 func (m *mockMessage) Index() *uint64                                        { return nil }
 func (m *mockMessage) BrokerPublishTime() *time.Time                         { return nil }
 func (m *mockMessage) SchemaVersion() []byte                                 { return nil }
@@ -87,35 +88,45 @@ type ackTrackingConsumer struct {
 }
 
 func (c *ackTrackingConsumer) Chan() <-chan pulsarclient.ConsumerMessage { return c.Ch }
-func (c *ackTrackingConsumer) Subscription() string                     { return "test-sub" }
-func (c *ackTrackingConsumer) Unsubscribe() error                       { return nil }
-func (c *ackTrackingConsumer) UnsubscribeForce() error                  { return nil }
+func (c *ackTrackingConsumer) Subscription() string                      { return "test-sub" }
+func (c *ackTrackingConsumer) Unsubscribe() error                        { return nil }
+func (c *ackTrackingConsumer) UnsubscribeForce() error                   { return nil }
+
 func (c *ackTrackingConsumer) GetLastMessageIDs() ([]pulsarclient.TopicMessageID, error) {
 	return nil, nil
 }
-func (c *ackTrackingConsumer) Receive(_ context.Context) (pulsarclient.Message, error) {
-	msg := <-c.Ch
-	return msg.Message, nil
+
+func (c *ackTrackingConsumer) Receive(ctx context.Context) (pulsarclient.Message, error) {
+	select {
+	case msg, ok := <-c.Ch:
+		if !ok {
+			return nil, errors.New("consumer closed")
+		}
+		return msg.Message, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
+
 func (c *ackTrackingConsumer) Ack(_ pulsarclient.Message) error {
 	c.ackCount.Add(1)
 	return nil
 }
 func (c *ackTrackingConsumer) AckID(_ pulsarclient.MessageID) error       { return nil }
-func (c *ackTrackingConsumer) AckIDList(_ []pulsarclient.MessageID) error  { return nil }
+func (c *ackTrackingConsumer) AckIDList(_ []pulsarclient.MessageID) error { return nil }
 func (c *ackTrackingConsumer) AckWithTxn(_ pulsarclient.Message, _ pulsarclient.Transaction) error {
 	return nil
 }
-func (c *ackTrackingConsumer) AckCumulative(_ pulsarclient.Message) error     { return nil }
-func (c *ackTrackingConsumer) AckIDCumulative(_ pulsarclient.MessageID) error { return nil }
+func (c *ackTrackingConsumer) AckCumulative(_ pulsarclient.Message) error             { return nil }
+func (c *ackTrackingConsumer) AckIDCumulative(_ pulsarclient.MessageID) error         { return nil }
 func (c *ackTrackingConsumer) ReconsumeLater(_ pulsarclient.Message, _ time.Duration) {}
 func (c *ackTrackingConsumer) ReconsumeLaterWithCustomProperties(
 	_ pulsarclient.Message, _ map[string]string, _ time.Duration,
 ) {
 }
-func (c *ackTrackingConsumer) Nack(_ pulsarclient.Message)      {}
-func (c *ackTrackingConsumer) NackID(_ pulsarclient.MessageID)  {}
-func (c *ackTrackingConsumer) Close()                           {}
+func (c *ackTrackingConsumer) Nack(_ pulsarclient.Message)         {}
+func (c *ackTrackingConsumer) NackID(_ pulsarclient.MessageID)     {}
+func (c *ackTrackingConsumer) Close()                              {}
 func (c *ackTrackingConsumer) Seek(_ pulsarclient.MessageID) error { return nil }
 func (c *ackTrackingConsumer) SeekByTime(_ time.Time) error        { return nil }
 func (c *ackTrackingConsumer) Name() string                        { return "mock-consumer" }
@@ -152,7 +163,7 @@ func newPubsubMetadata(kvs map[string]string) pubsub.Metadata {
 }
 
 // newProcessModePulsar builds a minimal *Pulsar wired with a component-level
-// ProcessMode. MaxConcurrentHandlers is set high so the semaphore does not
+// ProcessMode. MaxConcurrentHandlers is set high so the worker pool does not
 // artificially constrain concurrency in async tests.
 func newProcessModePulsar(componentProcessMode string) *Pulsar {
 	return &Pulsar{
@@ -243,11 +254,20 @@ func TestParsePulsarMetadataZeroMaxConcurrentHandlers(t *testing.T) {
 
 // effectiveProcessMode mirrors the resolution in listenMessage:
 // component metadata is already normalized to lowercase by parsePulsarMetadata;
-// subscription metadata override is lowercased at point of use.
+// subscription metadata override is lowercased and validated at point of use.
 func effectiveProcessMode(componentMode string, subMeta map[string]string) string {
 	mode := strings.ToLower(componentMode)
+	if mode == "" {
+		mode = processModeAsync
+	}
 	if v, ok := subMeta[processModeKey]; ok {
-		mode = strings.ToLower(v)
+		override := strings.ToLower(v)
+		switch override {
+		case processModeAsync, processModeSync:
+			mode = override
+		default:
+			// Invalid override is ignored; keep component default.
+		}
 	}
 	return mode
 }
@@ -318,7 +338,7 @@ func TestResolveProcessMode(t *testing.T) {
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
 			mode := effectiveProcessMode(tc.componentMode, tc.subMeta)
-			gotSync := strings.ToLower(mode) == processModeSync
+			gotSync := strings.EqualFold(mode, processModeSync)
 			assert.Equal(t, tc.wantSync, gotSync,
 				"effectiveProcessMode(%q, %v) = %q; wantSync=%v",
 				tc.componentMode, tc.subMeta, mode, tc.wantSync)
@@ -356,7 +376,7 @@ func TestListenMessageSyncMode_ComponentMetadata(t *testing.T) {
 	consumer := newMockConsumer(numMessages)
 	p := newProcessModePulsar("sync")
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{
@@ -374,14 +394,22 @@ func TestListenMessageSyncMode_ComponentMetadata(t *testing.T) {
 		p.listenMessage(ctx, req, consumer, handler)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
-
-	// Handler 1 is blocked; handler 2 must NOT have been invoked yet.
-	assert.Equal(t, int32(1), handlerCallCount.Load(),
+	// Wait until exactly one handler invocation has occurred. Since the handler
+	// blocks on the 'released' channel, this ensures the second handler has not
+	// been invoked while the first is still running.
+	require.Eventually(t, func() bool {
+		return handlerCallCount.Load() == 1
+	}, 2*time.Second, 10*time.Millisecond,
 		"sync mode: second handler must not fire while first is still running")
 
 	close(released)
-	time.Sleep(100 * time.Millisecond)
+	// After releasing the first handler, wait until all messages have been handled
+	// before cancelling the context.
+	require.Eventually(t, func() bool {
+		return handlerCallCount.Load() == int32(numMessages)
+	}, 2*time.Second, 10*time.Millisecond,
+		"all messages must be handled before cancel")
+
 	cancel()
 
 	select {
@@ -422,7 +450,7 @@ func TestListenMessageAsyncMode_ComponentMetadata(t *testing.T) {
 	consumer := newMockConsumer(numMessages)
 	p := newProcessModePulsar("async")
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{
@@ -440,10 +468,19 @@ func TestListenMessageAsyncMode_ComponentMetadata(t *testing.T) {
 		p.listenMessage(ctx, req, consumer, handler)
 	}()
 
-	time.Sleep(150 * time.Millisecond)
+	// Wait until all handlers have started (they all block on the barrier).
+	require.Eventually(t, func() bool {
+		return inFlight.Load() == int32(numMessages)
+	}, 2*time.Second, 10*time.Millisecond,
+		"async mode: all handlers should start concurrently")
 
 	close(barrier)
-	time.Sleep(100 * time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		return inFlight.Load() == 0
+	}, 2*time.Second, 10*time.Millisecond,
+		"all handlers should complete after barrier release")
+
 	cancel()
 
 	select {
@@ -474,7 +511,7 @@ func TestListenMessageSubscriptionOverridesComponent(t *testing.T) {
 	consumer := newMockConsumer(2)
 	p := newProcessModePulsar("async") // component says async
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{
@@ -491,13 +528,18 @@ func TestListenMessageSubscriptionOverridesComponent(t *testing.T) {
 		p.listenMessage(ctx, req, consumer, handler)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
-
-	assert.Equal(t, int32(1), handlerCallCount.Load(),
+	require.Eventually(t, func() bool {
+		return handlerCallCount.Load() == 1
+	}, 2*time.Second, 10*time.Millisecond,
 		"subscription sync override: second handler must not fire while first is running")
 
 	close(released)
-	time.Sleep(100 * time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		return handlerCallCount.Load() == 2
+	}, 2*time.Second, 10*time.Millisecond,
+		"both messages should be handled after release")
+
 	cancel()
 
 	select {
@@ -534,7 +576,7 @@ func TestListenMessageDefaultFallbackAsync(t *testing.T) {
 	consumer := newMockConsumer(numMessages)
 	p := newProcessModePulsar("") // no processMode set anywhere
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{
@@ -552,9 +594,18 @@ func TestListenMessageDefaultFallbackAsync(t *testing.T) {
 		p.listenMessage(ctx, req, consumer, handler)
 	}()
 
-	time.Sleep(150 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return inFlight.Load() == int32(numMessages)
+	}, 2*time.Second, 10*time.Millisecond,
+		"default async: all handlers should start concurrently")
+
 	close(barrier)
-	time.Sleep(100 * time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		return inFlight.Load() == 0
+	}, 2*time.Second, 10*time.Millisecond,
+		"all handlers should complete after barrier release")
+
 	cancel()
 
 	select {
@@ -591,7 +642,7 @@ func TestListenMessageCaseInsensitiveSync(t *testing.T) {
 			consumer := newMockConsumer(2)
 			p := newProcessModePulsar("") // no component-level processMode
 
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 
 			req := pubsub.SubscribeRequest{
@@ -608,13 +659,18 @@ func TestListenMessageCaseInsensitiveSync(t *testing.T) {
 				p.listenMessage(ctx, req, consumer, handler)
 			}()
 
-			time.Sleep(50 * time.Millisecond)
-
-			assert.Equal(t, int32(1), callCount.Load(),
+			require.Eventually(t, func() bool {
+				return callCount.Load() == 1
+			}, 2*time.Second, 10*time.Millisecond,
 				"processMode %q should be treated as sync; second handler fired prematurely", variant)
 
 			close(released)
-			time.Sleep(100 * time.Millisecond)
+
+			require.Eventually(t, func() bool {
+				return callCount.Load() == 2
+			}, 2*time.Second, 10*time.Millisecond,
+				"both messages should be handled after release")
+
 			cancel()
 
 			select {

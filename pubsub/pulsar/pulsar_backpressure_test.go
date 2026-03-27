@@ -13,16 +13,17 @@ limitations under the License.
 
 package pulsar
 
-// Tests for the async semaphore concurrency limit in listenMessage.
+// Tests for the async worker pool backpressure in listenMessage.
 //
 // The bug: in async mode every message spawned a goroutine with NO upper bound.
 // MaxConcurrentHandlers (default 100) only controlled the channel buffer size —
 // NOT the number of concurrent goroutines. This caused tens of thousands of
 // unacked messages to accumulate.
 //
-// Fix: a semaphore channel of size MaxConcurrentHandlers is created inside
-// listenMessage. The loop blocks on semaphore acquisition before spawning each
-// async goroutine, and releases the slot when the goroutine finishes.
+// Fix: listenMessage pre-spawns MaxConcurrentHandlers worker goroutines that
+// read directly from the consumer channel. Backpressure is achieved naturally:
+// when all workers are busy the consumer channel fills up, and the SDK stops
+// requesting more messages from the broker.
 //
 // Shared mock types (mockMessage, ackTrackingConsumer, sendMsg) are defined in
 // process_mode_test.go.
@@ -43,7 +44,7 @@ import (
 )
 
 // newTestPulsarWithConcurrency builds a minimal *Pulsar with controlled
-// MaxConcurrentHandlers for semaphore tests.
+// MaxConcurrentHandlers for worker pool concurrency tests.
 func newTestPulsarWithConcurrency(maxConcurrent uint) *Pulsar {
 	return &Pulsar{
 		logger:  logger.NewLogger("test"),
@@ -135,7 +136,7 @@ func TestListenMessage_AsyncConcurrencyLimit(t *testing.T) {
 				consumer.Ch <- msg
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 			defer cancel()
 
 			req := pubsub.SubscribeRequest{
@@ -159,7 +160,7 @@ func TestListenMessage_AsyncConcurrencyLimit(t *testing.T) {
 			<-done
 			p.wg.Wait()
 
-			assert.LessOrEqual(t, peakConcurrency.Load(), int64(tc.maxConcurrent),
+			assert.LessOrEqual(t, peakConcurrency.Load(), int64(tc.maxConcurrent), //nolint:gosec // test value, no overflow risk
 				"peak concurrent handlers exceeded MaxConcurrentHandlers=%d", tc.maxConcurrent)
 			assert.Equal(t, int64(tc.messagesToSend), processed.Load(),
 				"all messages should have been processed")
@@ -189,7 +190,7 @@ func TestListenMessage_AsyncAllMessagesProcessed(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{
@@ -214,10 +215,11 @@ func TestListenMessage_AsyncAllMessagesProcessed(t *testing.T) {
 	assert.Equal(t, int64(messagesToSend), processed.Load())
 }
 
-// TestListenMessage_ContextCancellationUnblocksSemaphore tests that cancelling
-// the context while the semaphore is full causes listenMessage to return
-// promptly without blocking indefinitely on semaphore acquisition.
-func TestListenMessage_ContextCancellationUnblocksSemaphore(t *testing.T) {
+// TestListenMessage_ContextCancellationUnblocksWorkerPool verifies that
+// cancelling the context while a worker is blocked in its handler causes
+// listenMessage to return promptly, and that in-flight handlers are allowed
+// to complete cleanly once unblocked.
+func TestListenMessage_ContextCancellationUnblocksWorkerPool(t *testing.T) {
 	const maxConcurrent = 1
 
 	p := newTestPulsarWithConcurrency(maxConcurrent)
@@ -226,24 +228,20 @@ func TestListenMessage_ContextCancellationUnblocksSemaphore(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	handlerCanProceed := make(chan struct{})
 
-	var handlerCallCount atomic.Int64
-
 	handler := func(ctx context.Context, msg *pubsub.NewMessage) error {
-		count := handlerCallCount.Add(1)
-		if count == 1 {
-			// Signal that the first handler started, then block.
-			close(handlerStarted)
-			<-handlerCanProceed
+		// Signal that the handler started, then block.
+		select {
+		case handlerStarted <- struct{}{}:
+		default:
 		}
+		<-handlerCanProceed
 		return nil
 	}
 
-	// First message: blocks in the handler, holding the semaphore slot.
-	// Second message: queued; the loop will block on semaphore acquisition for it.
 	sendMsg(consumer.Ch, consumer, []byte("first"))
 	sendMsg(consumer.Ch, consumer, []byte("second"))
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	req := pubsub.SubscribeRequest{
 		Topic:    "test-topic",
@@ -256,28 +254,29 @@ func TestListenMessage_ContextCancellationUnblocksSemaphore(t *testing.T) {
 		p.listenMessage(ctx, req, consumer, handler)
 	}()
 
-	// Wait for the first handler to start and hold the semaphore.
-	<-handlerStarted
-
-	// Cancel context; this should unblock the semaphore wait for the second message.
-	cancel()
-
-	// listenMessage should return within a reasonable time after context cancellation.
+	// Wait for the worker to start processing and block.
 	select {
-	case <-done:
-		// Expected: loop exited due to context cancellation.
+	case <-handlerStarted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("listenMessage did not exit after context cancellation — semaphore likely blocked")
+		t.Fatal("handler did not start within timeout")
 	}
 
-	// Allow the blocked handler to finish cleanly.
+	// Cancel context and unblock the handler so the worker can finish.
+	cancel()
 	close(handlerCanProceed)
-	p.wg.Wait()
+
+	// listenMessage waits for workers to finish before returning.
+	select {
+	case <-done:
+		// Expected: listenMessage exited after workers completed.
+	case <-time.After(2 * time.Second):
+		t.Fatal("listenMessage did not exit after context cancellation and handler release")
+	}
 }
 
-// TestListenMessage_SyncModeNotAffectedBySemaphore verifies that sync mode still
-// processes messages serially and is not broken by the semaphore addition.
-func TestListenMessage_SyncModeNotAffectedBySemaphore(t *testing.T) {
+// TestListenMessage_SyncModeNotAffectedByWorkerPool verifies that sync mode still
+// processes messages serially and is not broken by the async worker pool.
+func TestListenMessage_SyncModeNotAffectedByWorkerPool(t *testing.T) {
 	const messagesToSend = 5
 
 	// semaphore is not used in sync mode; provide any value.
@@ -314,7 +313,7 @@ func TestListenMessage_SyncModeNotAffectedBySemaphore(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{
@@ -343,26 +342,32 @@ func TestListenMessage_SyncModeNotAffectedBySemaphore(t *testing.T) {
 }
 
 // TestListenMessage_BackpressureStopsChannelDrain verifies that when all
-// semaphore slots are occupied by slow handlers, the consumer channel stops
-// draining — the loop blocks on semaphore acquisition rather than reading more.
+// workers are busy, the consumer channel stops draining — workers block in
+// their handlers and stop reading from consumer.Chan().
+//
+// With maxConcurrent=2, workers pull one message each and block. The remaining
+// messages stay in the consumer channel. There is no intermediate work channel.
 func TestListenMessage_BackpressureStopsChannelDrain(t *testing.T) {
 	const maxConcurrent = 2
 
 	p := newTestPulsarWithConcurrency(maxConcurrent)
 
-	// Buffer large enough that extra messages can queue behind the semaphore.
+	// Buffer large enough that extra messages can queue.
 	consumer := newMockConsumer(20)
 
 	handlerStarted := make(chan struct{}, maxConcurrent)
 	handlerCanProceed := make(chan struct{})
 
 	handler := func(ctx context.Context, msg *pubsub.NewMessage) error {
-		handlerStarted <- struct{}{}
+		select {
+		case handlerStarted <- struct{}{}:
+		default:
+		}
 		<-handlerCanProceed
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{
@@ -370,9 +375,10 @@ func TestListenMessage_BackpressureStopsChannelDrain(t *testing.T) {
 		Metadata: map[string]string{processModeKey: processModeAsync},
 	}
 
-	// Pre-fill exactly maxConcurrent messages to occupy all semaphore slots.
-	for i := 0; i < maxConcurrent; i++ {
-		sendMsg(consumer.Ch, consumer, []byte("occupying"))
+	// Send enough messages to leave plenty in the consumer channel after workers start.
+	const totalMessages = 10
+	for range totalMessages {
+		sendMsg(consumer.Ch, consumer, []byte("msg"))
 	}
 
 	done := make(chan struct{})
@@ -381,8 +387,8 @@ func TestListenMessage_BackpressureStopsChannelDrain(t *testing.T) {
 		p.listenMessage(ctx, req, consumer, handler)
 	}()
 
-	// Wait for all slots to be taken.
-	for i := 0; i < maxConcurrent; i++ {
+	// Wait for all workers to be busy.
+	for range maxConcurrent {
 		select {
 		case <-handlerStarted:
 		case <-time.After(2 * time.Second):
@@ -390,23 +396,17 @@ func TestListenMessage_BackpressureStopsChannelDrain(t *testing.T) {
 		}
 	}
 
-	// Now add more messages while the semaphore is fully occupied.
-	const extraMessages = 5
-	for i := 0; i < extraMessages; i++ {
-		sendMsg(consumer.Ch, consumer, []byte("extra"))
-	}
+	// Workers read directly from consumer.Chan(). Once all workers are blocked
+	// in their handlers, they stop pulling messages. The consumer channel should
+	// retain all messages beyond what the workers took (totalMessages - maxConcurrent).
+	minRemaining := totalMessages - maxConcurrent
 
-	// Give the loop a chance to drain (it should NOT drain since semaphore is full).
-	time.Sleep(100 * time.Millisecond)
-
-	// The channel should be nearly full. The loop reads one message at a time:
-	// it removes the message from the channel and THEN blocks on the semaphore.
-	// So at most one message is "in flight" inside the select (removed from the
-	// channel but waiting for a semaphore slot). All remaining messages stay queued.
-	channelLen := len(consumer.Ch)
-	assert.GreaterOrEqual(t, channelLen, extraMessages-1,
-		"backpressure: channel should retain most messages when semaphore is full (got %d, want >= %d)",
-		channelLen, extraMessages-1)
+	// Verify backpressure: the consumer channel must never drop below minRemaining.
+	require.Never(t, func() bool {
+		return len(consumer.Ch) < minRemaining
+	}, 200*time.Millisecond, 10*time.Millisecond,
+		"backpressure: consumer channel should retain at least %d messages",
+		minRemaining)
 
 	// Unblock handlers and let everything finish.
 	close(handlerCanProceed)
@@ -416,9 +416,10 @@ func TestListenMessage_BackpressureStopsChannelDrain(t *testing.T) {
 	p.wg.Wait()
 }
 
-// TestListenMessage_GracefulShutdown verifies that after listenMessage exits,
-// all in-flight handler goroutines complete (p.wg.Wait() returns promptly),
-// demonstrating that Close() will not leak goroutines.
+// TestListenMessage_GracefulShutdown verifies that listenMessage waits for
+// all in-flight handlers to complete before returning, ensuring that
+// consumer.Close() (deferred by listenMessage) does not race with Ack/Nack
+// calls from active workers.
 func TestListenMessage_GracefulShutdown(t *testing.T) {
 	const (
 		maxConcurrent  = 3
@@ -434,13 +435,15 @@ func TestListenMessage_GracefulShutdown(t *testing.T) {
 	}
 
 	handlerCanProceed := make(chan struct{})
+	var handlersStarted atomic.Int64
 
 	handler := func(ctx context.Context, msg *pubsub.NewMessage) error {
+		handlersStarted.Add(1)
 		<-handlerCanProceed
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	req := pubsub.SubscribeRequest{
 		Topic:    "test-topic",
@@ -453,37 +456,29 @@ func TestListenMessage_GracefulShutdown(t *testing.T) {
 		p.listenMessage(ctx, req, consumer, handler)
 	}()
 
-	// Give some handlers time to start and block.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until handlers have started and are blocked.
+	require.Eventually(t, func() bool {
+		return handlersStarted.Load() >= int64(maxConcurrent)
+	}, 2*time.Second, 10*time.Millisecond,
+		"handlers did not start within timeout")
 
-	// Cancel the context to trigger shutdown of the listen loop.
+	// Cancel the context to trigger shutdown. listenMessageAsync will wait
+	// for in-flight workers before returning.
 	cancel()
 
-	// Wait for listenMessage to exit.
-	select {
-	case <-listenDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("listenMessage did not exit after context cancel")
-	}
-
-	// Allow handlers to proceed.
+	// Unblock the handlers so workers can finish.
 	close(handlerCanProceed)
 
-	waitDone := make(chan struct{})
-	go func() {
-		defer close(waitDone)
-		p.wg.Wait()
-	}()
-
+	// listenMessage should return after all workers complete.
 	select {
-	case <-waitDone:
+	case <-listenDone:
 	case <-time.After(3 * time.Second):
-		t.Fatal("wg.Wait() did not return within timeout — goroutines may be leaked")
+		t.Fatal("listenMessage did not exit after context cancel and handler release — workers may be leaked")
 	}
 }
 
 // TestListenMessage_HandlerErrorDoesNotLeakGoroutine verifies that handlers
-// returning errors do not cause goroutine leaks under the semaphore.
+// returning errors do not cause goroutine leaks under the worker pool.
 func TestListenMessage_HandlerErrorDoesNotLeakGoroutine(t *testing.T) {
 	const (
 		maxConcurrent  = 5
@@ -504,7 +499,7 @@ func TestListenMessage_HandlerErrorDoesNotLeakGoroutine(t *testing.T) {
 		return assert.AnError
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{
@@ -573,7 +568,7 @@ func TestListenMessage_KeyVerification(t *testing.T) {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	req := pubsub.SubscribeRequest{

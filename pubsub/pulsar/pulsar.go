@@ -201,7 +201,8 @@ func parsePulsarMetadata(meta pubsub.Metadata) (*pulsarMetadata, error) {
 		return nil, fmt.Errorf("invalid processMode %q: accepted values are %q and %q", m.ProcessMode, processModeAsync, processModeSync)
 	}
 
-	// Guard against zero MaxConcurrentHandlers which would deadlock the semaphore.
+	// Guard against zero MaxConcurrentHandlers: a zero-size work channel with no
+	// workers would block the dispatch loop immediately.
 	if m.MaxConcurrentHandlers == 0 {
 		m.MaxConcurrentHandlers = defaultConcurrency
 	}
@@ -720,47 +721,90 @@ func (p *Pulsar) listenMessage(ctx context.Context, req pubsub.SubscribeRequest,
 	// Resolve effective process mode: component metadata is already normalized
 	// to lowercase in parsePulsarMetadata; subscription metadata may override.
 	mode := p.metadata.ProcessMode
+	if mode == "" {
+		mode = processModeAsync
+	}
 	if v, ok := req.Metadata[processModeKey]; ok {
-		mode = strings.ToLower(v)
+		override := strings.ToLower(v)
+		switch override {
+		case processModeAsync, processModeSync:
+			mode = override
+		default:
+			p.logger.Warnf(
+				"Invalid process mode %q in subscription metadata for topic %s; using component default %q",
+				v, req.Topic, mode,
+			)
+		}
 	}
 
-	// Semaphore to bound the number of concurrent async handler goroutines.
-	// The semaphore slot is acquired before spawning a goroutine (outside the
-	// goroutine) so that the read loop blocks — providing backpressure —
-	// when MaxConcurrentHandlers goroutines are already active.
-	sem := make(chan struct{}, p.metadata.MaxConcurrentHandlers)
-
 	originTopic := req.Topic
+
+	if mode == processModeSync {
+		p.listenMessageSync(ctx, originTopic, consumer, handler)
+	} else {
+		p.listenMessageAsync(ctx, originTopic, consumer, handler)
+	}
+}
+
+// listenMessageSync processes messages sequentially on the calling goroutine.
+func (p *Pulsar) listenMessageSync(ctx context.Context, originTopic string, consumer pulsar.Consumer, handler pubsub.Handler) {
 	for {
 		select {
-		case msg := <-consumer.Chan():
-			if mode == processModeSync { //nolint:gocritic
-				if err := p.handleMessage(ctx, originTopic, msg, handler); err != nil && !errors.Is(err, context.Canceled) {
-					p.logger.Errorf("Error sync processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
-				}
-			} else { // async process mode by default
-				// Acquire a semaphore slot before spawning the goroutine.
-				// Use a select so that context cancellation unblocks a waiting acquire.
-				select {
-				case sem <- struct{}{}:
-				case <-ctx.Done():
-					return
-				}
-				p.wg.Add(1)
-				go func(msg pulsar.ConsumerMessage) {
-					defer p.wg.Done()
-					defer func() { <-sem }()
-					if err := p.handleMessage(ctx, originTopic, msg, handler); err != nil && !errors.Is(err, context.Canceled) {
-						p.logger.Errorf("Error async processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
-					}
-				}(msg)
+		case msg, ok := <-consumer.Chan():
+			if !ok {
+				return
 			}
-
+			if err := p.handleMessage(ctx, originTopic, msg, handler); err != nil && !errors.Is(err, context.Canceled) {
+				p.logger.Errorf("Error sync processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
+			}
 		case <-ctx.Done():
 			p.logger.Debugf("Subscription context done. Closing consumer. Err: %s", ctx.Err())
 			return
 		}
 	}
+}
+
+// listenMessageAsync pre-spawns MaxConcurrentHandlers worker goroutines that
+// read directly from the consumer channel. Backpressure is achieved naturally:
+// when all workers are busy processing messages, the consumer channel fills up
+// and the SDK stops requesting more messages from the broker. There is no
+// intermediate work channel, so MaxConcurrentHandlers bounds both the number
+// of concurrent handlers and the consumer channel buffer (set in Subscribe).
+func (p *Pulsar) listenMessageAsync(ctx context.Context, originTopic string, consumer pulsar.Consumer, handler pubsub.Handler) {
+	// Use a local WaitGroup for workers so that we can wait for in-flight
+	// handlers to finish their Ack/Nack calls before returning. The caller
+	// defers consumer.Close(), so returning early would close the consumer
+	// while workers are still processing messages.
+	var workerWg sync.WaitGroup
+
+	// Pre-spawn a fixed pool of worker goroutines reading from consumer.Chan().
+	for range p.metadata.MaxConcurrentHandlers {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for {
+				select {
+				case msg, ok := <-consumer.Chan():
+					if !ok {
+						return
+					}
+					if err := p.handleMessage(ctx, originTopic, msg, handler); err != nil && !errors.Is(err, context.Canceled) {
+						p.logger.Errorf("Error async processing message: %s/%#v [key=%s]: %v", msg.Topic(), msg.ID(), msg.Key(), err)
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// Block until context is cancelled, then wait for workers to finish
+	// processing in-flight messages before returning. This ensures
+	// consumer.Close() (deferred by the caller) does not race with
+	// Ack/Nack calls from active workers.
+	<-ctx.Done()
+	p.logger.Debugf("Subscription context done. Closing consumer. Err: %s", ctx.Err())
+	workerWg.Wait()
 }
 
 func (p *Pulsar) handleMessage(ctx context.Context, originTopic string, msg pulsar.ConsumerMessage, handler pubsub.Handler) error {
